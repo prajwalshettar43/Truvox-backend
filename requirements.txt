@@ -1,0 +1,9 @@
+fastapi==0.111.0
+uvicorn==0.30.1
+numpy==1.25.2
+onnxruntime==1.18.0
+insightface==0.7.3
+opencv-python-headless==4.9.0.80
+cryptography==42.0.7
+python-multipart==0.0.9
+pydantic==2.7.1

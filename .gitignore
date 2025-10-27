@@ -1,0 +1,5 @@
+.vscode
+**/__pycache__/
+*.pycS
+*.onnx
+truvox-ml
