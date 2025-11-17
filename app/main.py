@@ -10,11 +10,13 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import cv2  # Assuming this is used in your actual face_utils
 import insightface  # Assuming this is used in your actual face_utils
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Path, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Path, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
-
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+import logging
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
@@ -26,6 +28,10 @@ from jose import JWTError, jwt
 
 from fastapi.middleware.cors import CORSMiddleware
 from routes.election_routes import router as election_router
+from routes.vote_routes import vote_router
+
+from pathlib import Path as PathlibPath
+from fastapi.staticfiles import StaticFiles
 
 # ==============================================================================
 # SECTION 1: CONFIGURATION
@@ -47,6 +53,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB", "voting_system")
 VOTERS_COLLECTION_NAME = "voters"
 ADMINS_COLLECTION_NAME = "district_admins"
+
 
 # --- Encryption Key for Biometrics ---
 # In production: use secure key management (Vault/KMS) and never hardcode keys.
@@ -265,9 +272,14 @@ def verify_embeddings(emb1: np.ndarray, emb2: np.ndarray, threshold: float) -> (
 print("Initializing FastAPI App...")
 app = FastAPI(title="TRUVOX - Integrated Biometric and Admin API")
 
+PathlibPath("uploads/candidate_photos").mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+
 origins = [
     "http://localhost:3000",  # For Create React App
     "http://localhost:5173",  # For Vite
+    "http://localhost:5174",
 ]
 
 app.add_middleware(
@@ -281,6 +293,16 @@ app.add_middleware(
 # --- Biometric Endpoints ---
 
 app.include_router(election_router)
+app.include_router(vote_router, prefix="/api", tags=["Voting"])
+
+
+logger = logging.getLogger("uvicorn.error")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error("RequestValidationError: %s\nBody: %s", exc, await request.body())
+    # return default structure so client still gets 422 with details
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 @app.post("/enroll", tags=["Biometric Voting"])
 async def enroll(
@@ -290,6 +312,8 @@ async def enroll(
     gender: Optional[str] = Form(None),
     address: Optional[str] = Form(None),
     epic: str = Form(...),
+    karnatakaConstituencies: Optional[str] = Form(None),
+    parliamentaryConstituencies: Optional[str] = Form(None),
     photo: UploadFile = File(...)
 ):
     if get_voter(epic) is not None:
@@ -315,6 +339,8 @@ async def enroll(
     voter_record = {
         "name": name, "father_name": father_name, "dob": dob, "gender": gender,
         "address": address, "epic": epic,
+        "karnatakaConstituencies": karnatakaConstituencies,
+        "parliamentaryConstituencies": parliamentaryConstituencies,
         "biometrics": {
             "embedding_enc": base64.b64encode(emb_enc).decode("utf-8"),
             "model": "insightface_arcface_r50", "meta": meta
