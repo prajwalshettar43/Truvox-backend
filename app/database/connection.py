@@ -18,3 +18,5 @@ db = client[DB_NAME]
 
 election_collection = db["elections"]
 vote_collection = db["votes"]
+voter_collection = db["voters"]
+log_collection = db["logs"]

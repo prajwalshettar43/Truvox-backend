@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from models.vote_model import Vote
-from database.connection import election_collection
+from database.connection import election_collection,voter_collection
 from bson import ObjectId
 import subprocess
 import re
@@ -109,20 +109,49 @@ def cast_vote(vote: Vote):
 # ------------------------------
 # ✅ CHECK IF USER HAS ALREADY VOTED
 # ------------------------------
-@vote_router.get("/check/{election_id}/{epic_id}")
+@vote_router.get("/check/{election_id}/{epic_id}") 
 def check_vote(election_id: str, epic_id: str):
     """
-    Checks if a voter (EPIC ID) has already voted in a given election.
+    Checks if a voter (EPIC ID) is eligible to vote and has already voted.
+    Includes constituency validation.
     """
     try:
         election_obj_id = ObjectId(election_id)
     except:
         raise HTTPException(status_code=400, detail="Invalid election ID format.")
 
-    election = election_collection.find_one({"_id": election_obj_id}, {"votes": 1})
+    # Fetch election (include its constituency)
+    election = election_collection.find_one(
+        {"_id": election_obj_id}, 
+        {"votes": 1, "constituency": 1}
+    )
     if not election:
         raise HTTPException(status_code=404, detail="Election not found.")
 
+    # Fetch voter constituency details
+    voter = voter_collection.find_one(
+        {"_id": epic_id}
+    )
+    if not voter:
+        raise HTTPException(status_code=404, detail="Voter not found.")
+
+    voter_k = voter.get("karnatakaConstituencies")
+    voter_p = voter.get("parliamentaryConstituencies")
+    election_const = election.get("constituency")
+
+    # --------------------------
+    # NEW: Constituency Check
+    # --------------------------
+    if election_const not in [voter_k, voter_p]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Voter does not belong to the constituency of this election. "
+                   f"Election constituency: {election_const}"
+        )
+
+    # --------------------------
+    # Check if voter already voted
+    # --------------------------
     for v in election.get("votes", []):
         if v["epic_id"] == epic_id:
             return {

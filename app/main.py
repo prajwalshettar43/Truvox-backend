@@ -32,7 +32,7 @@ from routes.vote_routes import vote_router
 
 from pathlib import Path as PathlibPath
 from fastapi.staticfiles import StaticFiles
-
+from database.connection import log_collection 
 # ==============================================================================
 # SECTION 1: CONFIGURATION
 # ==============================================================================
@@ -101,6 +101,8 @@ class DistrictAdminOut(DistrictAdminBase):
 class StatusUpdateRequest(BaseModel):
     status: str
 
+class LogRequest(BaseModel):
+    message: str
 # = a=============================================================================
 # SECTION 3: SECURITY UTILS (Hashing, Tokens)
 # ==============================================================================
@@ -280,6 +282,7 @@ origins = [
     "http://localhost:3000",  # For Create React App
     "http://localhost:5173",  # For Vite
     "http://localhost:5174",
+    "http://localhost:5175",
 ]
 
 app.add_middleware(
@@ -420,7 +423,25 @@ async def verify(
 
     return resp
 
+@app.post("/log-message", tags=["System Logs"])
+async def log_message(data: LogRequest):
+    log_collection.insert_one({"message": data.message})
+    
+    return {"status": "Message saved"}
 
+@app.get("/logs", tags=["System Logs"], response_model=List[Dict[str, Any]])
+async def get_all_logs():
+    """
+    Retrieves all stored log messages, converting MongoDB ObjectIds to strings.
+    """
+    logs = []
+    # Fetch all documents from the collection
+    for log_document in log_collection.find({}):
+        # Convert MongoDB's BSON ObjectId to a JSON-serializable string
+        log_document['_id'] = str(log_document['_id'])
+        logs.append(log_document)
+        
+    return logs
 @app.get("/voters", tags=["Biometric Voting"])
 async def get_all_voters():
     return list_voters()
