@@ -1,67 +1,75 @@
 from fastapi import APIRouter, HTTPException
 from models.vote_model import Vote
-from database.connection import election_collection,voter_collection
+# Ensure you add vote_ledger to your database connection file
+from database.connection import election_collection, voter_collection, vote_ledger 
 from bson import ObjectId
-import subprocess
-import re
+import hashlib
+import uuid
+from datetime import datetime
 
 vote_router = APIRouter(prefix="/vote", tags=["Vote"])
 
 # ------------------------------
-# ✅ CAST VOTE API (Embedded)
+# ✅ BLOCKCHAIN SIMULATION HELPERS
 # ------------------------------
-CHANNEL_NAME = "evidencechannel"
-CHAINCODE_NAME = "basic_1"
 
+def calculate_hash(data: str, prev_hash: str) -> str:
+    """Generates a SHA-256 hash to simulate blockchain linking."""
+    raw_string = f"{data}{prev_hash}"
+    return hashlib.sha256(raw_string.encode()).hexdigest()
 
-def execute_blockchain_command(epic_id: str, candidate_name: str) -> str:
+def add_to_ledger(epic_id: str, candidate_name: str, election_id: str) -> str:
     """
-    Executes peer chaincode invoke command and returns transaction ID.
-    Stores epic_id + candidate_name on blockchain.
+    Acts as the 'Smart Contract'. 
+    Adds a new block to the vote_ledger collection with a hash link to the previous vote.
+    Returns the Transaction ID.
     """
-    # Construct data to be stored on blockchain (can be customized)
-    vote_key = f"{{{{{{{epic_id}|||{candidate_name}}}}}}}"
+    txn_id = str(uuid.uuid4())
+    
+    # 1. Get the last block to chain hashes (Blockchain behavior)
+    last_block = vote_ledger.find_one(sort=[("_id", -1)])
+    prev_hash = last_block["current_hash"] if last_block else "GENESIS_BLOCK"
 
-    # Build the command
-    cmd = f"""peer chaincode invoke -o orderer.example.com:7050 \
-        --tls true --cafile $ORDERER_CA \
-        -C {CHANNEL_NAME} -n {CHAINCODE_NAME} \
-        --peerAddresses localhost:7051 \
-        --tlsRootCertFiles $PEER0_ORG1_CA \
-        -c '{{"Args":["AddEvidence","{vote_key}"]}}'"""
+    # 2. Create data payload
+    vote_data_string = f"{epic_id}|{candidate_name}|{election_id}|{txn_id}"
+    
+    # 3. Calculate Hash
+    current_hash = calculate_hash(vote_data_string, prev_hash)
 
-    try:
-        # Run command
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+    # 4. Create Ledger Entry (Immutable Source of Truth)
+    ledger_entry = {
+        "transaction_id": txn_id,
+        "epic_id": epic_id,
+        "candidate": candidate_name,
+        "election_id": election_id,
+        "previous_hash": prev_hash,
+        "current_hash": current_hash,
+        "timestamp": datetime.utcnow()
+    }
 
-        # Combine outputs for inspection
-        output = (result.stdout or result.stderr).strip()
-        print("Blockchain invoke output:", output)
+    # 5. Insert into Ledger Database
+    vote_ledger.insert_one(ledger_entry)
+    
+    print(f"🔗 Block added to Ledger: {txn_id}")
+    return txn_id
 
-        # Extract transaction ID
-        import re
-        match = re.search(r"Transaction ID:\s*([a-f0-9]+)", output, re.I)
-        if match:
-            txn_id = match.group(1)
-            print("Extracted Transaction ID:", txn_id)
-            return txn_id
-        else:
-            raise Exception("Transaction ID not found in blockchain response")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Blockchain error: {str(e)}")
+def get_vote_from_ledger(txn_id: str) -> dict:
+    """
+    Fetches the immutable record from the ledger database.
+    """
+    record = vote_ledger.find_one({"transaction_id": txn_id})
+    if not record:
+        raise Exception("Transaction not found in Ledger")
+    return record
 
 
+# ------------------------------
+# ✅ CAST VOTE API
+# ------------------------------
 @vote_router.post("/cast")
 def cast_vote(vote: Vote):
     """
-    Casts a vote and records the transaction on blockchain.
+    Casts a vote and records the transaction on the Shadow Ledger (Blockchain).
     """
     # ✅ Validate election ID
     try:
@@ -84,17 +92,20 @@ def cast_vote(vote: Vote):
         if existing_vote["epic_id"] == vote.epic_id:
             raise HTTPException(status_code=400, detail="Voter has already voted.")
 
-    # ✅ Call blockchain logic
-    txn_id = execute_blockchain_command(vote.epic_id, vote.candidate_name)
+    # ✅ 1. WRITE TO LEDGER (The "Blockchain")
+    # We write here first. If this fails, the vote doesn't count.
+    try:
+        txn_id = add_to_ledger(vote.epic_id, vote.candidate_name, vote.election_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ledger Write Error: {str(e)}")
 
-    # ✅ Create vote entry
+    # ✅ 2. UPDATE REAL DATABASE (The Display DB)
     vote_data = {
         "epic_id": vote.epic_id,
         "candidate": vote.candidate_name,
         "transaction_id": txn_id,
     }
 
-    # ✅ Save in MongoDB
     election_collection.update_one(
         {"_id": election_obj_id},
         {"$push": {"votes": vote_data}}
@@ -111,16 +122,11 @@ def cast_vote(vote: Vote):
 # ------------------------------
 @vote_router.get("/check/{election_id}/{epic_id}") 
 def check_vote(election_id: str, epic_id: str):
-    """
-    Checks if a voter (EPIC ID) is eligible to vote and has already voted.
-    Includes constituency validation.
-    """
     try:
         election_obj_id = ObjectId(election_id)
     except:
         raise HTTPException(status_code=400, detail="Invalid election ID format.")
 
-    # Fetch election (include its constituency)
     election = election_collection.find_one(
         {"_id": election_obj_id}, 
         {"votes": 1, "constituency": 1}
@@ -128,10 +134,7 @@ def check_vote(election_id: str, epic_id: str):
     if not election:
         raise HTTPException(status_code=404, detail="Election not found.")
 
-    # Fetch voter constituency details
-    voter = voter_collection.find_one(
-        {"_id": epic_id}
-    )
+    voter = voter_collection.find_one({"_id": epic_id})
     if not voter:
         raise HTTPException(status_code=404, detail="Voter not found.")
 
@@ -139,19 +142,12 @@ def check_vote(election_id: str, epic_id: str):
     voter_p = voter.get("parliamentaryConstituencies")
     election_const = election.get("constituency")
 
-    # --------------------------
-    # NEW: Constituency Check
-    # --------------------------
     if election_const not in [voter_k, voter_p]:
         raise HTTPException(
             status_code=403,
-            detail=f"Voter does not belong to the constituency of this election. "
-                   f"Election constituency: {election_const}"
+            detail=f"Voter does not belong to election constituency: {election_const}"
         )
 
-    # --------------------------
-    # Check if voter already voted
-    # --------------------------
     for v in election.get("votes", []):
         if v["epic_id"] == epic_id:
             return {
@@ -159,11 +155,12 @@ def check_vote(election_id: str, epic_id: str):
                 "details": {
                     "epic_id": v["epic_id"],
                     "candidate": v["candidate"],
-                    "txn": v.get("txn")
+                    "txn": v.get("transaction_id")
                 }
             }
 
     return {"status": "not_voted", "message": "Voter can proceed to vote."}
+
 
 @vote_router.get("/results/{election_id}")
 def get_results(election_id: str):
@@ -181,97 +178,12 @@ def get_results(election_id: str):
 
     results = list(election_collection.aggregate(pipeline))
     return {"results": results}
-def extract_pattern_from_blockchain(raw_data: bytes) -> str:
-    """
-    Robust extraction of pattern {{{EPIC|||CANDIDATE}}} from raw binary data returned
-    by peer chaincode query (qscc or your chaincode). Uses find() instead of only regex,
-    so small binary/control bytes nearby won't prevent extraction.
-    Returns a string "EPIC-CANDIDATE" or raises Exception if not found.
-    """
-    # 1) decode safely (latin-1 preserves byte values 1:1)
-    text = raw_data.decode("latin-1", errors="ignore")
 
-    # 2) try simple string-based extraction (most robust)
-    start_token = "{{{"
-    end_token = "}}}"
-    start_idx = text.find(start_token)
-    if start_idx != -1:
-        end_idx = text.find(end_token, start_idx + len(start_token))
-        if end_idx != -1:
-            inner = text[start_idx + len(start_token) : end_idx]
-            # inner expected format: EPIC|||CANDIDATE
-            if "|||" in inner:
-                epic, candidate = inner.split("|||", 1)
-                return f"{epic.strip()}-{candidate.strip()}"
-            # if no |||, still return inner as-is (fallback)
-            return inner.strip()
-
-    # 3) fallback: permissive regex that allows escaped braces or noise between braces
-    #    This catches cases like \"{{{...}}} or some control bytes between braces
-    regex = re.compile(r"\\?\{\{\{\s*([^\|]{1,}?)\s*\|\|\|\s*(.*?)\s*\}\}\}", re.DOTALL)
-    m = regex.search(text)
-    if m:
-        epic = m.group(1).strip()
-        candidate = m.group(2).strip()
-        return f"{epic}-{candidate}"
-
-    # 4) last resort: try to find any occurrence of triple-braces in the 'strings' of the output
-    #    extract all printable substrings length>=4 and check for pattern
-    printable_chunks = re.findall(r"[ -~]{4,}", text)  # printable ascii sequences
-    for chunk in printable_chunks:
-        if "{{{" in chunk and "}}}" in chunk and "|||" in chunk:
-            s = chunk
-            s = s[s.find("{{{") + 3 : s.find("}}}")]
-            if "|||" in s:
-                epic, candidate = s.split("|||", 1)
-                return f"{epic.strip()}-{candidate.strip()}"
-
-    # If none matched, log the first ~400 chars for debugging and raise
-    snippet = text[:400].replace("\n", "\\n")
-    logger.debug(f"Blockchain raw snippet (first 400 chars): {snippet!r}")
-    raise Exception("Pattern not found in blockchain data")
-
-def query_blockchain_transaction(txn_id: str) -> str:
-    """
-    Queries Hyperledger Fabric blockchain for a transaction by ID
-    and extracts EPIC-CANDIDATE info from its data.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "peer", "chaincode", "query",
-                "-C", "evidencechannel",
-                "-n", "qscc",
-                "-c", f'{{"Args":["GetTransactionByID","{CHANNEL_NAME}","{txn_id}"]}}'
-            ],
-            capture_output=True,
-            text=False  # keep as bytes
-        )
-        if result.returncode != 0:
-            raise Exception(result.stderr.decode())
-            
-        # Extract data pattern
-        key = extract_pattern_from_blockchain(result.stdout)
-        if not key:
-            raise Exception("Pattern not found in blockchain data")
-
-        return key
-
-    except Exception as e:
-        raise Exception(f"Blockchain query error for {txn_id}: {e}")
-
-
-# 🧩 Main endpoint
 @vote_router.post("/verify-election-integrity")
 def verify_election_integrity(data: dict):
     """
-    Verifies all votes in a given election against blockchain data.
-    If mismatches are found, updates MongoDB to match blockchain.
-    
-    Request body:
-    {
-      "election_id": "<MongoDB ObjectId>"
-    }
+    Verifies votes against the Shadow Ledger.
+    Returns the EXACT output format as the original Blockchain code.
     """
     election_id = data.get("election_id")
     if not election_id:
@@ -282,67 +194,76 @@ def verify_election_integrity(data: dict):
     except:
         raise HTTPException(status_code=400, detail="Invalid election ID format.")
 
-    # ✅ Fetch election document
+    # 1. Fetch the mutable election data
     election = election_collection.find_one({"_id": election_obj_id})
     if not election:
         raise HTTPException(status_code=404, detail="Election not found.")
 
     votes = election.get("votes", [])
-    if not votes:
-        return {"message": "No votes found in this election."}
-
+    
+    # These lists match your original structure exactly
     corrected = []
     verified = []
 
-    # ✅ Verify each vote against blockchain
-    for vote in votes:
-        epic_id = vote.get("epic_id")
-        candidate = vote.get("candidate")
-        txn = vote.get("transaction_id")
+    print(f"🔍 Starting Integrity Check for Election: {election_id}")
 
-        if not txn:
-            print(f"⚠️ Skipping vote without transaction ID: {epic_id}")
+    for vote in votes:
+        db_epic = vote.get("epic_id")
+        db_candidate = vote.get("candidate")
+        txn_id = vote.get("transaction_id")
+
+        if not txn_id:
             continue
 
         try:
-            on_chain_key = query_blockchain_transaction(txn)
-
-            if not on_chain_key or "-" not in on_chain_key:
-                print(f"⚠️ Could not extract valid data for txn {txn}")
+            # 2. Query the 'Shadow Ledger' (Truth Source)
+            ledger_record = vote_ledger.find_one({"transaction_id": txn_id})
+            
+            if not ledger_record:
+                print(f"⚠️ Txn {txn_id} not found in ledger")
                 continue
 
-            on_chain_epic, on_chain_candidate = on_chain_key.split("-", 1)
+            ledger_epic = ledger_record.get("epic_id")
+            ledger_candidate = ledger_record.get("candidate")
 
-            if on_chain_epic != epic_id or on_chain_candidate.strip() != candidate.strip():
-                print(f"❌ Mismatch for {txn}: DB({epic_id}-{candidate}) vs BC({on_chain_key})")
+            # 3. Compare (DB vs Ledger)
+            # We format strings like 'EPIC-CANDIDATE' to match your original output style
+            db_string = f"{db_epic}-{db_candidate}"
+            ledger_string = f"{ledger_epic}-{ledger_candidate}"
 
-                # Update MongoDB to match blockchain data
+            if db_string != ledger_string:
+                print(f"❌ Mismatch: DB({db_string}) vs Ledger({ledger_string})")
+
+                # 4. Auto-Correct Real Database
                 election_collection.update_one(
-                    {"_id": election_obj_id, "votes.transaction_id": txn},
+                    {"_id": election_obj_id, "votes.transaction_id": txn_id},
                     {
                         "$set": {
-                            "votes.$.epic_id": on_chain_epic.strip(),
-                            "votes.$.candidate": on_chain_candidate.strip()
+                            "votes.$.epic_id": ledger_epic,
+                            "votes.$.candidate": ledger_candidate
                         }
                     }
                 )
 
+                # ✅ MATCHING ORIGINAL OUTPUT STRUCTURE
                 corrected.append({
-                    "transaction_id": txn,
-                    "old": f"{epic_id}-{candidate}",
-                    "new": on_chain_key
+                    "transaction_id": txn_id,
+                    "old": db_string,       # e.g., "ABC12345-Hacker"
+                    "new": ledger_string    # e.g., "ABC12345-RealCandidate"
                 })
             else:
+                # ✅ MATCHING ORIGINAL OUTPUT STRUCTURE
                 verified.append({
-                    "transaction_id": txn,
-                    "epic_id": epic_id,
-                    "candidate": candidate
+                    "transaction_id": txn_id,
+                    "epic_id": db_epic,
+                    "candidate": db_candidate
                 })
 
         except Exception as e:
-            print(f"⚠️ Error verifying txn {txn}: {e}")
+            print(f"⚠️ Error verifying txn {txn_id}: {e}")
             continue
 
+    # ✅ RETURN EXACTLY AS ORIGINAL
     return {
         "status": "completed",
         "verified_count": len(verified),

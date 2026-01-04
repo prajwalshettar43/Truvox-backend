@@ -15,8 +15,9 @@ if not DB_NAME:
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-
+db2 = client["Temp"]
 election_collection = db["elections"]
 vote_collection = db["votes"]
 voter_collection = db["voters"]
 log_collection = db["logs"]
+vote_ledger=db2["vote_leadger"]
